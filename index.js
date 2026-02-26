@@ -8,14 +8,23 @@ const {
 const axios = require("axios");
 const dayjs = require("dayjs");
 const utc = require("dayjs/plugin/utc");
+const timezone = require("dayjs/plugin/timezone");
+
 dayjs.extend(utc);
+dayjs.extend(timezone);
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
-client.once("ready", () => {
+let twitchToken = null;
+
+/* ===============================
+   起動時
+=================================*/
+client.once("ready", async () => {
   console.log("BOT Ready");
+  twitchToken = await getTwitchToken();
 });
 
 /* ===============================
@@ -37,30 +46,28 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   try {
-    let result;
-
-    if (platform === "yt") {
-      result = await searchYouTube(channelInput, targetDate);
-    } else {
-      result = await searchTwitch(channelInput, targetDate);
-    }
+    let result =
+      platform === "yt"
+        ? await searchYouTube(channelInput, targetDate)
+        : await searchTwitch(channelInput, targetDate);
 
     if (!result) {
       return interaction.editReply("該当時間の配信はありませんでした");
     }
 
     const embed = new EmbedBuilder()
+      .setAuthor({
+        name: result.channelName,
+        url: result.channelUrl,
+        iconURL: result.channelIcon,
+      })
       .setTitle(result.title)
       .setDescription(
-    `${result.channel}
-    ${result.start} ~ ${result.end}
-    \`\`\`${result.url}\`\`\``
+        `🕒 ${result.start} - ${result.end}\n🔗 ${result.url}`
       )
       .setColor(platform === "yt" ? 0xff0000 : 0x9146ff);
 
-      await interaction.editReply({
-        embeds: [embed],
-      });
+    await interaction.editReply({ embeds: [embed] });
 
   } catch (err) {
     console.error(err);
@@ -69,7 +76,7 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 /* ===============================
-   日時パース（JST → UTC変換）
+   日時パース（JST→UTC）
 =================================*/
 function parseDate(input) {
   const formats = [
@@ -80,20 +87,18 @@ function parseDate(input) {
   ];
 
   for (const f of formats) {
-    const d = dayjs(input, f, true);
-    if (d.isValid()) {
-      return d.utc();
-    }
+    const d = dayjs.tz(input, f, "Asia/Tokyo", true);
+    if (d.isValid()) return d.utc();
   }
   return null;
 }
 
 /* ===============================
-   YouTube検索（ゆる検索Lv2）
+   YouTube検索（最適化版）
 =================================*/
 async function searchYouTube(channelName, targetDate) {
 
-  // チャンネル検索（最大10件）
+  // チャンネル検索
   const channelRes = await axios.get(
     "https://www.googleapis.com/youtube/v3/search",
     {
@@ -101,7 +106,7 @@ async function searchYouTube(channelName, targetDate) {
         part: "snippet",
         type: "channel",
         q: channelName,
-        maxResults: 10,
+        maxResults: 5,
         key: process.env.YOUTUBE_API_KEY,
       },
     }
@@ -109,14 +114,24 @@ async function searchYouTube(channelName, targetDate) {
 
   if (!channelRes.data.items.length) return null;
 
-  // 🔥 ゆる一致ロジック
-  const normalizedInput = normalize(channelName);
-
-  const bestMatch = channelRes.data.items.find(c =>
-    normalize(c.snippet.channelTitle).includes(normalizedInput)
-  ) || channelRes.data.items[0];
-
+  const bestMatch = channelRes.data.items[0];
   const channelId = bestMatch.id.channelId;
+
+  // チャンネル詳細（アイコン取得）
+  const channelDetail = await axios.get(
+    "https://www.googleapis.com/youtube/v3/channels",
+    {
+      params: {
+        part: "snippet",
+        id: channelId,
+        key: process.env.YOUTUBE_API_KEY,
+      },
+    }
+  );
+
+  const channelData = channelDetail.data.items[0];
+  const channelIcon = channelData.snippet.thumbnails.default.url;
+  const channelUrl = `https://youtube.com/channel/${channelId}`;
 
   const dayStart = targetDate.startOf("day").toISOString();
   const dayEnd = targetDate.endOf("day").toISOString();
@@ -130,7 +145,7 @@ async function searchYouTube(channelName, targetDate) {
         type: "video",
         publishedAfter: dayStart,
         publishedBefore: dayEnd,
-        maxResults: 50,
+        maxResults: 20,
         key: process.env.YOUTUBE_API_KEY,
       },
     }
@@ -138,7 +153,6 @@ async function searchYouTube(channelName, targetDate) {
 
   if (!videosRes.data.items.length) return null;
 
-  // 🔥 詳細を一括取得（quota節約）
   const videoIds = videosRes.data.items.map(v => v.id.videoId).join(",");
 
   const detailRes = await axios.get(
@@ -156,17 +170,21 @@ async function searchYouTube(channelName, targetDate) {
     if (!data.liveStreamingDetails) continue;
 
     const start = dayjs.utc(data.liveStreamingDetails.actualStartTime);
-    const end = dayjs.utc(data.liveStreamingDetails.actualEndTime);
+    const end = data.liveStreamingDetails.actualEndTime
+      ? dayjs.utc(data.liveStreamingDetails.actualEndTime)
+      : dayjs.utc(); // 配信中対応
 
     if (
-      targetDate.isAfter(start) &&
-      targetDate.isBefore(end)
+      (targetDate.isAfter(start) || targetDate.isSame(start)) &&
+      (targetDate.isBefore(end) || targetDate.isSame(end))
     ) {
       return {
         title: data.snippet.title,
-        channel: data.snippet.channelTitle,
-        start: start.local().format("YYYY/MM/DD HH:mm:ss"),
-        end: end.local().format("YYYY/MM/DD HH:mm:ss"),
+        channelName: channelData.snippet.title,
+        channelIcon,
+        channelUrl,
+        start: start.local().format("YY/MM/DD HH:mm"),
+        end: end.local().format("YY/MM/DD HH:mm"),
         url: `https://youtube.com/watch?v=${data.id}`,
       };
     }
@@ -176,11 +194,65 @@ async function searchYouTube(channelName, targetDate) {
 }
 
 /* ===============================
-   Twitch検索（最大50件）
+   Twitch検索（トークン再利用）
 =================================*/
 async function searchTwitch(channelName, targetDate) {
 
-  const tokenRes = await axios.post(
+  const userRes = await axios.get(
+    "https://api.twitch.tv/helix/users",
+    {
+      headers: {
+        "Client-ID": process.env.TWITCH_CLIENT_ID,
+        Authorization: `Bearer ${twitchToken}`,
+      },
+      params: { login: channelName },
+    }
+  );
+
+  if (!userRes.data.data.length) return null;
+
+  const user = userRes.data.data[0];
+
+  const videosRes = await axios.get(
+    "https://api.twitch.tv/helix/videos",
+    {
+      headers: {
+        "Client-ID": process.env.TWITCH_CLIENT_ID,
+        Authorization: `Bearer ${twitchToken}`,
+      },
+      params: { user_id: user.id, type: "archive", first: 50 },
+    }
+  );
+
+  for (const v of videosRes.data.data) {
+    const start = dayjs.utc(v.created_at);
+    const durationSec = parseDuration(v.duration);
+    const end = start.add(durationSec, "second");
+
+    if (
+      (targetDate.isAfter(start) || targetDate.isSame(start)) &&
+      (targetDate.isBefore(end) || targetDate.isSame(end))
+    ) {
+      return {
+        title: v.title,
+        channelName: user.display_name,
+        channelIcon: user.profile_image_url,
+        channelUrl: `https://twitch.tv/${user.login}`,
+        start: start.local().format("YY/MM/DD HH:mm"),
+        end: end.local().format("YY/MM/DD HH:mm"),
+        url: v.url,
+      };
+    }
+  }
+
+  return null;
+}
+
+/* ===============================
+   Twitchトークン取得
+=================================*/
+async function getTwitchToken() {
+  const res = await axios.post(
     "https://id.twitch.tv/oauth2/token",
     null,
     {
@@ -191,54 +263,7 @@ async function searchTwitch(channelName, targetDate) {
       },
     }
   );
-
-  const accessToken = tokenRes.data.access_token;
-
-  const userRes = await axios.get(
-    "https://api.twitch.tv/helix/users",
-    {
-      headers: {
-        "Client-ID": process.env.TWITCH_CLIENT_ID,
-        Authorization: `Bearer ${accessToken}`,
-      },
-      params: { login: channelName },
-    }
-  );
-
-  if (!userRes.data.data.length) return null;
-  const userId = userRes.data.data[0].id;
-
-  const videosRes = await axios.get(
-    "https://api.twitch.tv/helix/videos",
-    {
-      headers: {
-        "Client-ID": process.env.TWITCH_CLIENT_ID,
-        Authorization: `Bearer ${accessToken}`,
-      },
-      params: { user_id: userId, type: "archive", first: 50 },
-    }
-  );
-
-  for (const v of videosRes.data.data) {
-    const start = dayjs.utc(v.created_at);
-    const durationSec = parseDuration(v.duration);
-    const end = start.add(durationSec, "second");
-
-    if (
-      targetDate.isAfter(start) &&
-      targetDate.isBefore(end)
-    ) {
-      return {
-        title: v.title,
-        channel: v.user_name,
-        start: start.local().format("YYYY/MM/DD HH:mm:ss"),
-        end: end.local().format("YYYY/MM/DD HH:mm:ss"),
-        url: v.url,
-      };
-    }
-  }
-
-  return null;
+  return res.data.access_token;
 }
 
 /* ===============================
@@ -249,16 +274,6 @@ function parseDuration(duration) {
   const m = duration.match(/(\d+)m/)?.[1] || 0;
   const s = duration.match(/(\d+)s/)?.[1] || 0;
   return Number(h) * 3600 + Number(m) * 60 + Number(s);
-}
-
-/* ===============================
-   文字列正規化（ゆる検索用）
-=================================*/
-function normalize(str) {
-  return str
-    .toLowerCase()
-    .replace(/\s+/g, "")
-    .replace(/[^\wぁ-んァ-ン一-龯]/g, "");
 }
 
 client.login(process.env.DISCORD_TOKEN);
