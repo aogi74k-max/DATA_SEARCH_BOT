@@ -20,14 +20,6 @@ const client = new Client({
 let twitchToken = null;
 
 /* ===============================
-   起動時
-=================================*/
-client.once("ready", async () => {
-  console.log("BOT Ready");
-  twitchToken = await getTwitchToken();
-});
-
-/* ===============================
    メイン処理
 =================================*/
 client.on("interactionCreate", async (interaction) => {
@@ -42,11 +34,13 @@ client.on("interactionCreate", async (interaction) => {
 
   const targetDate = parseDate(datetimeInput);
   if (!targetDate) {
-    return interaction.editReply("日時の形式が正しくありません");
+    return interaction.editReply(
+      "日時は YYYY-MM-DD HH:MM の形式で入力してください（例: 2026-02-14 00:20）"
+    );
   }
 
   try {
-    let result =
+    const result =
       platform === "yt"
         ? await searchYouTube(channelInput, targetDate)
         : await searchTwitch(channelInput, targetDate);
@@ -79,26 +73,45 @@ client.on("interactionCreate", async (interaction) => {
    日時パース（JST→UTC）
 =================================*/
 function parseDate(input) {
+  if (!/\d{1,2}:\d{2}/.test(input)) return null;
+
+  const now = dayjs().tz("Asia/Tokyo");
+
   const formats = [
-    "YYYY-MM-DD HH:mm",
-    "YYYY/MM/DD HH:mm",
-    "YYYY-MM-DD",
-    "YYYY/MM/DD",
+    "YYYY-M-D H:mm",
+    "YYYY/M/D H:mm",
+    "M/D H:mm",
+    "H:mm",
   ];
 
   for (const f of formats) {
-    const d = dayjs.tz(input, f, "Asia/Tokyo", true);
-    if (d.isValid()) return d.utc();
+    const parsed = dayjs.tz(input, f, "Asia/Tokyo", true);
+    if (parsed.isValid()) {
+
+      let finalDate = parsed;
+
+      if (!f.includes("YYYY")) {
+        finalDate = finalDate.year(now.year());
+      }
+
+      if (f === "H:mm") {
+        finalDate = finalDate
+          .month(now.month())
+          .date(now.date());
+      }
+
+      return finalDate.utc();
+    }
   }
+
   return null;
 }
 
 /* ===============================
-   YouTube検索（最適化版）
+   YouTube検索
 =================================*/
 async function searchYouTube(channelName, targetDate) {
 
-  // チャンネル検索
   const channelRes = await axios.get(
     "https://www.googleapis.com/youtube/v3/search",
     {
@@ -112,12 +125,10 @@ async function searchYouTube(channelName, targetDate) {
     }
   );
 
-  if (!channelRes.data.items.length) return null;
+  if (!channelRes.data?.items?.length) return null;
 
-  const bestMatch = channelRes.data.items[0];
-  const channelId = bestMatch.id.channelId;
+  const channelId = channelRes.data.items[0].id.channelId;
 
-  // チャンネル詳細（アイコン取得）
   const channelDetail = await axios.get(
     "https://www.googleapis.com/youtube/v3/channels",
     {
@@ -128,6 +139,8 @@ async function searchYouTube(channelName, targetDate) {
       },
     }
   );
+
+  if (!channelDetail.data?.items?.length) return null;
 
   const channelData = channelDetail.data.items[0];
   const channelIcon = channelData.snippet.thumbnails.default.url;
@@ -151,9 +164,11 @@ async function searchYouTube(channelName, targetDate) {
     }
   );
 
-  if (!videosRes.data.items.length) return null;
+  if (!videosRes.data?.items?.length) return null;
 
-  const videoIds = videosRes.data.items.map(v => v.id.videoId).join(",");
+  const videoIds = videosRes.data.items
+    .map(v => v.id.videoId)
+    .join(",");
 
   const detailRes = await axios.get(
     "https://www.googleapis.com/youtube/v3/videos",
@@ -172,7 +187,7 @@ async function searchYouTube(channelName, targetDate) {
     const start = dayjs.utc(data.liveStreamingDetails.actualStartTime);
     const end = data.liveStreamingDetails.actualEndTime
       ? dayjs.utc(data.liveStreamingDetails.actualEndTime)
-      : dayjs.utc(); // 配信中対応
+      : dayjs.utc();
 
     if (
       (targetDate.isAfter(start) || targetDate.isSame(start)) &&
@@ -194,9 +209,25 @@ async function searchYouTube(channelName, targetDate) {
 }
 
 /* ===============================
-   Twitch検索（トークン再利用）
+   Twitch検索
 =================================*/
 async function searchTwitch(channelName, targetDate) {
+  try {
+    return await searchTwitchCore(channelName, targetDate);
+  } catch (err) {
+    if (err.response?.status === 401) {
+      twitchToken = await getTwitchToken();
+      return await searchTwitchCore(channelName, targetDate);
+    }
+    throw err;
+  }
+}
+
+async function searchTwitchCore(channelName, targetDate) {
+
+  if (!twitchToken) {
+    twitchToken = await getTwitchToken();
+  }
 
   const userRes = await axios.get(
     "https://api.twitch.tv/helix/users",
@@ -209,7 +240,7 @@ async function searchTwitch(channelName, targetDate) {
     }
   );
 
-  if (!userRes.data.data.length) return null;
+  if (!userRes.data?.data?.length) return null;
 
   const user = userRes.data.data[0];
 
@@ -223,6 +254,8 @@ async function searchTwitch(channelName, targetDate) {
       params: { user_id: user.id, type: "archive", first: 50 },
     }
   );
+
+  if (!videosRes.data?.data?.length) return null;
 
   for (const v of videosRes.data.data) {
     const start = dayjs.utc(v.created_at);

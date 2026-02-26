@@ -18,7 +18,7 @@ const command = new SlashCommandBuilder()
       .setRequired(true))
   .addStringOption(o =>
     o.setName("datetime")
-      .setDescription("YYYY-MM-DD HH:mm")
+      .setDescription("例: 2026-02-14 00:20 / 2/14 0:20 / 0:20")
       .setRequired(true));
 
 const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
