@@ -18,6 +18,7 @@ const client = new Client({
 });
 
 let twitchToken = null;
+let twitchTokenExpire = null;
 
 /* ===============================
    メイン処理
@@ -86,22 +87,28 @@ function parseDate(input) {
 
   for (const f of formats) {
     const parsed = dayjs.tz(input, f, "Asia/Tokyo", true);
-    if (parsed.isValid()) {
+    if (!parsed.isValid()) continue;
 
-      let finalDate = parsed;
+    let finalDate = parsed;
 
-      if (!f.includes("YYYY")) {
-        finalDate = finalDate.year(now.year());
-      }
-
-      if (f === "H:mm") {
-        finalDate = finalDate
-          .month(now.month())
-          .date(now.date());
-      }
-
-      return finalDate.utc();
+    // 年が無い場合は今年を補完
+    if (!f.includes("YYYY")) {
+      finalDate = finalDate.year(now.year());
     }
+
+    // 時刻のみ指定なら今日補完
+    if (f === "H:mm") {
+      finalDate = finalDate
+        .month(now.month())
+        .date(now.date());
+    }
+
+    // 未来日補正（年跨ぎ対策）
+    if (finalDate.isAfter(now)) {
+      finalDate = finalDate.subtract(1, "year");
+    }
+
+    return finalDate.utc();
   }
 
   return null;
@@ -216,7 +223,7 @@ async function searchTwitch(channelName, targetDate) {
     return await searchTwitchCore(channelName, targetDate);
   } catch (err) {
     if (err.response?.status === 401) {
-      twitchToken = await getTwitchToken();
+      await getTwitchToken();
       return await searchTwitchCore(channelName, targetDate);
     }
     throw err;
@@ -225,8 +232,9 @@ async function searchTwitch(channelName, targetDate) {
 
 async function searchTwitchCore(channelName, targetDate) {
 
-  if (!twitchToken) {
-    twitchToken = await getTwitchToken();
+  // トークンが無い、または期限切れなら再取得
+  if (!twitchToken || Date.now() > twitchTokenExpire) {
+    await getTwitchToken();
   }
 
   const userRes = await axios.get(
@@ -296,7 +304,9 @@ async function getTwitchToken() {
       },
     }
   );
-  return res.data.access_token;
+
+  twitchToken = res.data.access_token;
+  twitchTokenExpire = Date.now() + (res.data.expires_in - 60) * 1000;
 }
 
 /* ===============================
